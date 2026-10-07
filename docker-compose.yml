@@ -1,0 +1,16 @@
+services:
+  n8n_saas_api:
+    image: n8n-saas-api:latest
+    container_name: n8n_saas_api
+
+    ports:
+      - "8000:8000"
+
+    networks:
+      - n8n_saas_network
+
+    restart: unless-stopped
+
+networks:
+  n8n_saas_network:
+    external: true
