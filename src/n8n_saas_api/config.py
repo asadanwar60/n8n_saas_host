@@ -11,14 +11,20 @@ class Settings(BaseSettings):
     n8n_auth_header_name: str = "X-Api-Key"
     n8n_auth_header_value: str = ""
 
+    # --- Upstream Admin RAG Ingestion (n8n Admin RAG Flow) ---
+    n8n_admin_rag_url: str = "http://82.112.231.185:5680/webhook/admin-rag-ingest"
+    n8n_admin_basic_user: str = ""
+    n8n_admin_basic_password: str = ""
+    max_upload_file_bytes: int = 25 * 1024 * 1024  # 25 MB default limit
+
     # --- Bots ---
     default_bot_id: str = "baveha_support"
     allowed_bot_ids: str = ""
 
     # --- Security & Rate Limiting ---
     cors_allow_origins: str = ""
-    rate_limit: str = "30/minute"
-    max_message_length: int = 4000
+    rate_limit: str = "10/minute"
+    max_message_length: int = 1000
 
     # --- Runtime & Logging ---
     log_level: str = "INFO"

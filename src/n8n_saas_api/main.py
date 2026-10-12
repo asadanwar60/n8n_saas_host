@@ -1,3 +1,4 @@
+import base64
 import json
 import logging
 import re
@@ -66,7 +67,7 @@ app.add_middleware(
     allow_origins=settings.cors_origins,
     allow_credentials=False,
     allow_methods=["GET", "POST", "OPTIONS"],
-    allow_headers=["Content-Type", "Authorization"],
+    allow_headers=["Content-Type", "Authorization", "X-Admin-Username", "X-Admin-Password"],
 )
 
 
@@ -262,4 +263,179 @@ async def chat(
         "sessionId": resolved_session_id,
         "session_id": resolved_session_id,
         "bot_id": resolved_bot_id,
+    }
+
+
+# --------------------------------------------------------------------------- #
+# Admin RAG Ingestion Routes (/v1/admin/rag)
+# --------------------------------------------------------------------------- #
+def _resolve_admin_auth_header(request: Request) -> str:
+    """Resolve HTTP Basic Auth header for n8n Admin Cred from request headers or server settings."""
+    auth_header = request.headers.get("authorization") or ""
+    if auth_header.lower().startswith("basic "):
+        return auth_header.strip()
+
+    header_user = request.headers.get("x-admin-username") or settings.n8n_admin_basic_user
+    header_pass = request.headers.get("x-admin-password") or settings.n8n_admin_basic_password
+    if header_user and header_pass:
+        token = base64.b64encode(f"{header_user}:{header_pass}".encode("utf-8")).decode("ascii")
+        return f"Basic {token}"
+
+    raise HTTPException(
+        status_code=401,
+        detail="Admin credentials (Basic Auth) are required to upload documents or ingest URLs.",
+    )
+
+
+@app.get("/v1/admin/rag")
+async def admin_rag_status():
+    return {"status": "ok", "service": "ai_support_admin_rag"}
+
+
+@app.post("/v1/admin/rag")
+@limiter.limit(settings.rate_limit)
+async def admin_rag_ingest(request: Request):
+    """
+    Embeddable Admin RAG endpoint supporting both:
+    - multipart/form-data file uploads (source_type='file', data=<UploadFile>, category, visibility)
+    - multipart/form-data or application/json URL ingestion (source_type='url', url=<https://...>, category, visibility)
+    Forwards request with n8n Admin Cred Basic Auth to n8n /webhook/admin-rag-ingest.
+    """
+    request_id = getattr(request.state, "request_id", "-")
+    if not settings.n8n_admin_rag_url:
+        raise HTTPException(status_code=503, detail="Admin RAG webhook URL is not configured.")
+
+    auth_header = _resolve_admin_auth_header(request)
+    content_type = (request.headers.get("content-type") or "").lower()
+
+    form_fields: Dict[str, str] = {}
+    upload_tuple: Optional[tuple] = None
+
+    if "application/json" in content_type:
+        try:
+            body_json = await request.json()
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid JSON payload.")
+        source_type = str(body_json.get("source_type") or "url").strip().lower()
+        url_val = str(body_json.get("url") or body_json.get("Website URL (Optional)") or "").strip()
+        category = str(
+            body_json.get("category")
+            or body_json.get("Document Category / Context Header")
+            or "General Knowledge Base"
+        ).strip()
+        visibility = str(
+            body_json.get("visibility")
+            or body_json.get("Access Visibility (Role Scope)")
+            or "public"
+        ).strip().lower()
+        if visibility not in {"public", "customer", "admin"}:
+            visibility = "public"
+        if source_type == "url" and not url_val:
+            raise HTTPException(status_code=400, detail="A valid URL is required when source_type is 'url'.")
+        form_fields = {
+            "source_type": source_type,
+            "url": url_val,
+            "category": category,
+            "visibility": visibility,
+        }
+    else:
+        form = await request.form()
+        raw_file = form.get("data") or form.get("file") or form.get("Upload File (Optional)")
+        url_val = str(form.get("url") or form.get("Website URL (Optional)") or "").strip()
+        source_type = str(
+            form.get("source_type") or ("file" if raw_file is not None else "url")
+        ).strip().lower()
+        category = str(
+            form.get("category")
+            or form.get("Document Category / Context Header")
+            or "General Knowledge Base"
+        ).strip()
+        visibility = str(
+            form.get("visibility")
+            or form.get("Access Visibility (Role Scope)")
+            or "public"
+        ).strip().lower()
+        if visibility not in {"public", "customer", "admin"}:
+            visibility = "public"
+
+        form_fields = {
+            "source_type": source_type,
+            "url": url_val,
+            "category": category,
+            "visibility": visibility,
+        }
+
+        if source_type == "file":
+            if raw_file is None or not hasattr(raw_file, "read"):
+                raise HTTPException(status_code=400, detail="Please attach a file to upload.")
+            file_bytes = await raw_file.read()
+            if not file_bytes:
+                raise HTTPException(status_code=400, detail="Uploaded file is empty.")
+            if len(file_bytes) > settings.max_upload_file_bytes:
+                raise HTTPException(status_code=413, detail="Uploaded file exceeds maximum allowed size.")
+            filename = getattr(raw_file, "filename", None) or "document.txt"
+            mime_type = getattr(raw_file, "content_type", None) or "application/octet-stream"
+            upload_tuple = (filename, file_bytes, mime_type)
+        elif not url_val:
+            raise HTTPException(status_code=400, detail="Please provide a valid Website URL to ingest.")
+
+    client: httpx.AsyncClient = request.app.state.http
+    headers = {"Authorization": auth_header}
+
+    try:
+        if upload_tuple is not None:
+            upstream_resp = await client.post(
+                settings.n8n_admin_rag_url,
+                data=form_fields,
+                files={"data": upload_tuple},
+                headers=headers,
+            )
+        else:
+            upstream_resp = await client.post(
+                settings.n8n_admin_rag_url,
+                data=form_fields,
+                headers=headers,
+            )
+    except httpx.TimeoutException:
+        logger.warning("admin rag timeout request_id=%s", request_id)
+        raise HTTPException(
+            status_code=504,
+            detail="Document indexing timed out. Please try a smaller document or retry.",
+        )
+    except httpx.RequestError as exc:
+        logger.error("admin rag unreachable request_id=%s err=%r", request_id, exc)
+        raise HTTPException(
+            status_code=503,
+            detail="Admin RAG ingestion service is temporarily unavailable.",
+        )
+
+    if upstream_resp.status_code in (401, 403):
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid Admin credentials. Please verify your Admin Cred username and password.",
+        )
+
+    if upstream_resp.is_error:
+        logger.error(
+            "admin rag upstream error request_id=%s status=%s body=%.500s",
+            request_id,
+            upstream_resp.status_code,
+            upstream_resp.text,
+        )
+        raise HTTPException(
+            status_code=502,
+            detail="Unable to index content right now. Please verify the file or URL and try again.",
+        )
+
+    try:
+        result_data = upstream_resp.json()
+    except ValueError:
+        result_data = {"status": "ok", "message": upstream_resp.text}
+
+    return {
+        "status": "ok",
+        "source_type": form_fields["source_type"],
+        "category": form_fields["category"],
+        "visibility": form_fields["visibility"],
+        "result": result_data,
     }
