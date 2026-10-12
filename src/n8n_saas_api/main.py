@@ -287,6 +287,37 @@ def _resolve_admin_auth_header(request: Request) -> str:
     )
 
 
+def _parse_multipart_body(content_type: str, raw_body: bytes) -> tuple[Dict[str, str], Optional[tuple]]:
+    """Zero-dependency multipart/form-data & urlencoded parser using Python stdlib."""
+    from email.parser import BytesParser
+    from email.policy import default as default_policy
+    from urllib.parse import parse_qsl
+
+    fields: Dict[str, str] = {}
+    upload_tuple: Optional[tuple] = None
+
+    if "multipart/form-data" in content_type.lower():
+        header_bytes = f"Content-Type: {content_type}\r\nMIME-Version: 1.0\r\n\r\n".encode("utf-8")
+        msg = BytesParser(policy=default_policy).parsebytes(header_bytes + raw_body)
+        if msg.is_multipart():
+            for part in msg.iter_parts():
+                name = part.get_param("name", header="content-disposition")
+                if not name:
+                    continue
+                filename = part.get_filename()
+                payload = part.get_payload(decode=True) or b""
+                if filename is not None or name in {"data", "file", "Upload File (Optional)"} and filename:
+                    mime_type = part.get_content_type() or "application/octet-stream"
+                    upload_tuple = (filename or "document.txt", payload, mime_type)
+                else:
+                    fields[name] = payload.decode("utf-8", errors="replace")
+    elif "application/x-www-form-urlencoded" in content_type.lower():
+        for k, v in parse_qsl(raw_body.decode("utf-8", errors="replace"), keep_blank_values=True):
+            fields[k] = v
+
+    return fields, upload_tuple
+
+
 @app.get("/v1/admin/rag")
 async def admin_rag_status():
     return {"status": "ok", "service": "ai_support_admin_rag"}
@@ -306,12 +337,12 @@ async def admin_rag_ingest(request: Request):
         raise HTTPException(status_code=503, detail="Admin RAG webhook URL is not configured.")
 
     auth_header = _resolve_admin_auth_header(request)
-    content_type = (request.headers.get("content-type") or "").lower()
+    content_type = request.headers.get("content-type") or ""
 
     form_fields: Dict[str, str] = {}
     upload_tuple: Optional[tuple] = None
 
-    if "application/json" in content_type:
+    if "application/json" in content_type.lower():
         try:
             body_json = await request.json()
         except Exception:
@@ -339,20 +370,23 @@ async def admin_rag_ingest(request: Request):
             "visibility": visibility,
         }
     else:
-        form = await request.form()
-        raw_file = form.get("data") or form.get("file") or form.get("Upload File (Optional)")
-        url_val = str(form.get("url") or form.get("Website URL (Optional)") or "").strip()
+        raw_body = await request.body()
+        if len(raw_body) > settings.max_upload_file_bytes + 65536:
+            raise HTTPException(status_code=413, detail="Uploaded file exceeds maximum allowed size.")
+
+        parsed_fields, upload_tuple = _parse_multipart_body(content_type, raw_body)
+        url_val = str(parsed_fields.get("url") or parsed_fields.get("Website URL (Optional)") or "").strip()
         source_type = str(
-            form.get("source_type") or ("file" if raw_file is not None else "url")
+            parsed_fields.get("source_type") or ("file" if upload_tuple is not None else "url")
         ).strip().lower()
         category = str(
-            form.get("category")
-            or form.get("Document Category / Context Header")
+            parsed_fields.get("category")
+            or parsed_fields.get("Document Category / Context Header")
             or "General Knowledge Base"
         ).strip()
         visibility = str(
-            form.get("visibility")
-            or form.get("Access Visibility (Role Scope)")
+            parsed_fields.get("visibility")
+            or parsed_fields.get("Access Visibility (Role Scope)")
             or "public"
         ).strip().lower()
         if visibility not in {"public", "customer", "admin"}:
@@ -366,16 +400,13 @@ async def admin_rag_ingest(request: Request):
         }
 
         if source_type == "file":
-            if raw_file is None or not hasattr(raw_file, "read"):
+            if upload_tuple is None:
                 raise HTTPException(status_code=400, detail="Please attach a file to upload.")
-            file_bytes = await raw_file.read()
+            _, file_bytes, _ = upload_tuple
             if not file_bytes:
                 raise HTTPException(status_code=400, detail="Uploaded file is empty.")
             if len(file_bytes) > settings.max_upload_file_bytes:
                 raise HTTPException(status_code=413, detail="Uploaded file exceeds maximum allowed size.")
-            filename = getattr(raw_file, "filename", None) or "document.txt"
-            mime_type = getattr(raw_file, "content_type", None) or "application/octet-stream"
-            upload_tuple = (filename, file_bytes, mime_type)
         elif not url_val:
             raise HTTPException(status_code=400, detail="Please provide a valid Website URL to ingest.")
 
